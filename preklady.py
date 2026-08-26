@@ -192,6 +192,8 @@ TEXTY = {
                          "pokud bude hlas divný, zvolte jiný jazykový model."),
     "log_ft_nepovedlo": ("WARNING: could not apply the checkpoint ({0}). Continuing with the base model.",
                          "VAROVÁNÍ: checkpoint se nepodařilo použít ({0}). Pokračuji se základním modelem."),
+    "log_wav_ponechan": ("Left as {0} - MP3 conversion happens once the book is finished.",
+                         "Ponecháno jako {0} - na MP3 se převede až po dokončení knihy."),
     # ---------------- Akcelerace MLX (Apple Silicon) ----------------
     "log_mlx_t3":       ("MLX: T3 running on the GPU cores, {0} backbone.",
                          "MLX: T3 běží na grafických jádrech, backbone {0}."),
