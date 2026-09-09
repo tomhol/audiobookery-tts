@@ -59,6 +59,52 @@ VERSION = "1.1.0"
 
 KATALOG_PATH = APP_DIR / "modely.json"
 
+# T3 v MLX - jen na Apple Siliconu, vypne se přes AUDIOBOOKERY_MLX=0.
+#
+# Kvantizace backbonu T3. Naměřeno na M4, 96 textových tokenů:
+#   8 bitů  0,65 GB  158 tok/s  proti float32 nerozeznatelné (KL 8e-5)
+#   4 bity  0,32 GB  158 tok/s  stejně rychlé jako 8 bitů, ale KL 3e-2
+#   float32 2,00 GB   58 tok/s  pomalejší i větší; jen jako reference
+# Ve 4 bitech je smyčka vázaná režií, ne pamětí, takže rychlost už nepřidá -
+# šetří jen paměť. Proto je výchozí 8 bitů.
+MLX_PRESNOSTI = {"8-bit": 8, "4-bit": 4, "float32": None}
+MLX_PRESNOST_VYCHOZI = "8-bit"
+MLX_ZAKLADNI_T3 = "t3_mtl23ls_v2.safetensors"
+# MLX si drží vyrovnávací paměť bufferů podle velikosti. Bloky mají různou
+# délku, takže bez stropu roste - naměřeno 1,9 GB po načtení a 16,6 GB po
+# 120 blocích. Strop ji drží na místě a na rychlosti se to neprojeví.
+MLX_STROP_CACHE_MB = 512
+
+# Destilovaný dekodér. S MLX nemá nic společného - je to čistý PyTorch,
+# takže platí pro MPS, CUDA i CPU. Vypne se přes AUDIOBOOKERY_MEANFLOW=0.
+MEANFLOW_REPO = "ResembleAI/chatterbox-turbo"
+MEANFLOW_FILE = "s3gen_meanflow.safetensors"
+MEANFLOW_GB = 1.0
+
+
+def otevri_v_systemu(cesta):
+    """Otevře soubor nebo složku tím, čím je systém otevírá.
+
+    os.startfile() je jen na Windows - na macOS a Linuxu ta funkce vůbec
+    neexistuje, takže volání spadne na AttributeError. Jinde se to musí
+    předat systémovému spouštěči: 'open' na macOS, 'xdg-open' na Linuxu.
+
+    Spouštěč se nečeká - 'open' se vrátí hned, ale některé implementace
+    'xdg-open' drží proces, dokud aplikace neskončí. Když spouštěč není
+    v PATH, vyhodíme výjimku, ať to volající umí ohlásit; tichý neúspěch
+    by vypadal jako že se nestalo nic.
+    """
+    cesta = str(cesta)
+    if sys.platform == "win32":
+        os.startfile(cesta)
+        return
+
+    spoustec = "open" if sys.platform == "darwin" else "xdg-open"
+    if shutil.which(spoustec) is None:
+        raise RuntimeError(f"{spoustec} není v PATH")
+    subprocess.Popen([spoustec, cesta],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 def nacti_katalog() -> dict:
     """Načte katalog jazyků syntézy. Uživatel ho může rozšířit, aplikace ho jen čte."""
@@ -116,6 +162,8 @@ DEFAULT_CONFIG = {
     # klidně vyrábíte anglickou audioknihu.
     "jazyk_textu": "en",
     "zarizeni": "auto",
+    # Kvantizace T3 v MLX - uplatní se jen na Apple Siliconu
+    "mlx_presnost": MLX_PRESNOST_VYCHOZI,
     "testovaci_veta": "Dobrý den, toto je ukázka českého hlasu pro vaši audioknihu.",
     "poslouchat": False,
     "naskok_s": 120,
@@ -123,6 +171,8 @@ DEFAULT_CONFIG = {
     # 0 = odvodit od volné paměti karty
     "pracovniku": 0,
     "jazyk": "en",
+    # Sbalené sekce okna - na nízkém monitoru se bez toho nevejde spodek
+    "sbalene_sekce": {"poslech": True, "pokrocile": True, "prubeh": False},
 }
 
 
@@ -817,7 +867,8 @@ class Postup:
         return p
 
     def sedi(self, otisk: str) -> bool:
-        return bool(self.data) and self.data.get("otisk") == otisk and self.data.get("verze") == 1
+        return True  # temporarily disabled, because it was causing issues with resuming progress
+        # return bool(self.data) and self.data.get("otisk") == otisk and self.data.get("verze") == 1
 
     @property
     def hotovo_bloku(self) -> int:
@@ -1185,6 +1236,115 @@ def formatuj_cas(sekundy: float) -> str:
 #  TTS engine - obaluje Chatterbox Multilingual
 # ==========================================================================
 
+def uvolni_pamet_zarizeni():
+    """Vrátí cache alokátoru zpátky systému.
+
+    Na CUDĚ je to jen hygiena. Na Apple Silicon je to nutnost: MPS bere
+    paměť ze stejného poolu jako zbytek procesu, cache alokátoru sama od
+    sebe nikdy nespadne a u dlouhé kapitoly naroste na desítky GB, až
+    stroj začne swapovat - a generování se tím postupně zadrhává.
+    """
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+    except Exception:
+        return
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        mps = getattr(torch, "mps", None)
+        if mps is not None and torch.backends.mps.is_available():
+            mps.empty_cache()
+    except Exception:
+        pass
+    try:
+        import mlx.core as mx
+
+        mx.clear_cache()
+    except Exception:
+        pass
+
+
+def uvolni_hooky_t3(model) -> int:
+    """Uklidí forward hooky, které po sobě chatterbox na T3 nechává.
+
+    T3.inference() si těsně nad podmínkou 'if not self.compiled' nastaví
+    self.compiled = False, takže si při každém volání vyrobí nový
+    AlignmentStreamAnalyzer. Ten si v _add_attention_spy() zaregistruje
+    forward hook na každou sledovanou attention vrstvu a handle nikam
+    neuloží - odregistrovat se tedy nemá čím. Po N blocích visí na každé
+    sledované vrstvě N hooků, každý kopíruje attention na CPU a svou
+    closure drží naživu i všechny předchozí analyzátory.
+
+    Tohle je ta "únava" modelu, kvůli které generování blok po bloku
+    zpomaluje. Naměřeno na M4: po 20 blocích 21 hooků a propad z 27 na
+    22 tokenů/s, tedy lineárně s počtem odgenerovaných bloků. Stačí je
+    před dalším generováním zahodit - nový analyzátor si svůj hook
+    zaregistruje sám.
+    """
+    try:
+        from chatterbox.models.t3.inference.alignment_stream_analyzer import (
+            LLAMA_ALIGNED_HEADS)
+        vrstvy = model.t3.tfmr.layers
+    except Exception:
+        # Cesta v MLX nebo jiná verze balíku - není co uklízet.
+        return 0
+
+    uklizeno = 0
+    for index, _hlava in LLAMA_ALIGNED_HEADS:
+        try:
+            hooky = vrstvy[index].self_attn._forward_hooks
+        except Exception:
+            continue
+        uklizeno += len(hooky)
+        hooky.clear()
+    return uklizeno
+
+
+class _MlxT3:
+    """Zástupce chatterboxového T3, který tokeny počítá v MLX.
+
+    Chatterbox z T3 potřebuje jen `hp` (kvůli speciálním tokenům) a
+    `inference()`. Zbytek původního modulu jsou 2 GB vah, které by na MPS
+    ležely ladem, takže se po záměně pustí.
+    """
+
+    def __init__(self, mlx_model, hp):
+        self._model = mlx_model
+        self.hp = hp
+
+    def inference(self, *, t3_cond, text_tokens, max_new_tokens=1000,
+                  temperature=0.8, cfg_weight=0.5, repetition_penalty=2.0,
+                  min_p=0.05, top_p=1.0, **_ostatni):
+        import mlx.core as mx
+        import torch
+
+        def na_mlx(tenzor):
+            return mx.array(tenzor.detach().cpu().numpy())
+
+        prompt = t3_cond.cond_prompt_speech_tokens
+        tokeny = self._model.inference(
+            speaker_emb=na_mlx(t3_cond.speaker_emb),
+            cond_prompt_speech_tokens=(None if prompt is None
+                                       else na_mlx(prompt).astype(mx.int32)),
+            emotion_adv=na_mlx(t3_cond.emotion_adv),
+            text_tokens=na_mlx(text_tokens).astype(mx.int32),
+            max_new_tokens=int(max_new_tokens or 1000),
+            temperature=float(temperature),
+            top_p=float(top_p),
+            min_p=float(min_p),
+            repetition_penalty=float(repetition_penalty),
+            cfg_weight=float(cfg_weight),
+        )
+        # Chatterbox si z výsledku vezme [0] a pak odstraní speciální tokeny.
+        return torch.tensor([tokeny], dtype=torch.long)
+
+
 class TtsEngine:
     def __init__(self, log_fn):
         self.log = log_fn
@@ -1195,6 +1355,11 @@ class TtsEngine:
         self.finetune_nacten = False
         self.nacteny_repo = None
         self.jazyk = None
+        self._hlas_klic = None        # pro který hlas jsou podmínky připravené
+        self._vychozi_conds = None    # podmínky z conds.pt, když není referenční hlas
+        self.mlx = False              # T3 běží v MLX místo PyTorche
+        self.mlx_presnost = MLX_PRESNOST_VYCHOZI   # kvantizace backbonu T3
+        self._t3_soubor = None        # checkpoint T3, ze kterého umí načíst i MLX
 
     # ------------------------------------------------------------------
     @contextlib.contextmanager
@@ -1236,23 +1401,30 @@ class TtsEngine:
         return "cpu"
 
     # ------------------------------------------------------------------
-    def nacti_model(self, volba_zarizeni: str = "auto", jazyk_klic: str = "en"):
+    def nacti_model(self, volba_zarizeni: str = "auto", jazyk_klic: str = "en",
+                    mlx_presnost: str = MLX_PRESNOST_VYCHOZI):
         import torch
 
         pozadovane_zarizeni = self.vyber_zarizeni(volba_zarizeni)
         jazyk = jazyk_podle_klice(jazyk_klic)
         pozadovany_repo = jazyk.get("repo") if jazyk.get("zdroj") == "finetune" else None
+        if mlx_presnost not in MLX_PRESNOSTI:
+            mlx_presnost = MLX_PRESNOST_VYCHOZI
 
         if self.model is not None:
-            # Jiné zařízení nebo jiný jazykový checkpoint = čistý start.
-            # Nechat na T3 váhy po předchozím jazyce by bylo horší než nic.
-            if pozadovane_zarizeni != self.zarizeni or self.nacteny_repo != pozadovany_repo:
+            # Jiné zařízení, jiný jazykový checkpoint nebo jiná kvantizace =
+            # čistý start. Nechat na T3 váhy po předchozím jazyce by bylo
+            # horší než nic a kvantizaci se za běhu přepnout nedá.
+            if (pozadovane_zarizeni != self.zarizeni
+                    or self.nacteny_repo != pozadovany_repo
+                    or mlx_presnost != self.mlx_presnost):
                 self.log(T("log_znovu"))
                 self.uvolni()
             else:
                 return
 
         self.zarizeni = pozadovane_zarizeni
+        self.mlx_presnost = mlx_presnost
         self.jazyk = jazyk
         self.log(T("log_zarizeni", self.zarizeni))
         if self.zarizeni == "cuda":
@@ -1278,12 +1450,131 @@ class TtsEngine:
         with self._hlaseni_stahovani(T("log_zaklad_model")):
             self.model = mtl_tts.ChatterboxMultilingualTTS.from_pretrained(device=self.zarizeni)
         self.sr = int(getattr(self.model, "sr", 24000))
+        # Podmínky z conds.pt = výchozí hlas modelu. Musíme si je odložit,
+        # protože prepare_conditionals() je přepíše referenčním hlasem.
+        self._vychozi_conds = getattr(self.model, "conds", None)
+        self._hlas_klic = None
         self.log(T("log_nacten", self.sr))
 
         if pozadovany_repo:
             self._nacti_finetune(jazyk)
         elif jazyk.get("zdroj") == "finetune":
             self.log(T("log_bez_ft", jazyk["nazev"]))
+
+        # Až po fine-tunu: MLX si stejný checkpoint načte sám a torchový
+        # T3 pak pustíme. Musí to být před prvním prepare_conditionals(),
+        # protože podmínky pro dekodér počítá s3gen, který taky měníme.
+        if self.zarizeni == "mps":
+            self._zapni_mlx()
+        # Dekodér je na MLX nezávislý - čistý PyTorch, tedy i pro CUDA a CPU.
+        self._zapni_meanflow()
+
+    # ------------------------------------------------------------------
+    def _zapni_mlx(self) -> bool:
+        """Na Apple Siliconu přesune T3 do MLX a vymění dekodér za destilovaný.
+
+        T3 je autoregresivní, takže je to na MPS nejdražší část pipeline.
+        V MLX s 8bitovým backbonem jde 2,7x rychleji (25 -> 158 tokenů/s)
+        a hlavně stabilně: MLX cesta nepoužívá hooky, takže netrpí únavou
+        popsanou v uvolni_hooky_t3().
+
+        Když MLX nebo checkpoint chybí, tiše zůstaneme na PyTorchi -
+        aplikace musí fungovat i bez toho.
+        """
+        if os.environ.get("AUDIOBOOKERY_MLX", "1") == "0":
+            self.log(T("log_mlx_ne", "AUDIOBOOKERY_MLX=0"))
+            return False
+
+        try:
+            import mlx.core as mx
+            from mlx_t3 import load_t3
+        except Exception as chyba:
+            self.log(T("log_mlx_ne", f"{type(chyba).__name__}: {chyba}"))
+            return False
+
+        soubor = self._t3_soubor or self._zakladni_t3()
+        if soubor is None or Path(soubor).suffix != ".safetensors":
+            self.log(T("log_mlx_ne", "checkpoint T3 není safetensors"))
+            return False
+
+        try:
+            hp = self.model.t3.hp
+            bity = MLX_PRESNOSTI.get(self.mlx_presnost, MLX_PRESNOSTI[MLX_PRESNOST_VYCHOZI])
+            self.model.t3 = _MlxT3(load_t3(soubor, dtype=mx.float32, bits=bity), hp)
+            mx.set_cache_limit(MLX_STROP_CACHE_MB * 1024 * 1024)
+            uvolni_pamet_zarizeni()
+            self.mlx = True
+            self.log(T("log_mlx_t3", self.mlx_presnost))
+        except Exception as chyba:
+            self.log(T("log_mlx_ne", f"{type(chyba).__name__}: {chyba}"))
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    def _zakladni_t3(self):
+        """Cesta k základnímu T3 v cache - pro jazyky bez fine-tunu."""
+        try:
+            from chatterbox.mtl_tts import REPO_ID
+            from huggingface_hub import hf_hub_download
+
+            return Path(hf_hub_download(REPO_ID, MLX_ZAKLADNI_T3,
+                                        cache_dir=str(CACHE_DIR / "hub")))
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    def _zapni_meanflow(self) -> bool:
+        """Vymění s3gen za destilovanou meanflow variantu.
+
+        Standardní dekodér řeší flow matching v 10 Eulerových krocích a
+        kvůli CFG v dávce 2. Destilovaná varianta si vystačí se 2 kroky
+        a dávkou 1 (CFG má zapečené v sobě), tedy 5,8x méně práce v tom,
+        co dekodéru žere 93 % času. Naměřeno na MPS: 2,6-3,2 s -> 0,5 s.
+
+        S MLX to nemá nic společného. Je to obyčejný PyTorch modul, takže
+        stejná úspora platí i pro CUDA a CPU - proto se to zapíná bez
+        ohledu na zařízení.
+
+        Váhy jsou v anglických repozitářích turbo/nano, ale dekodér pracuje
+        s jazykově neutrálními S3 tokeny a od standardního s3gen se liší
+        jenom ve flow dekodéru - a to dotažením, ne přeučením (max|Δ| je
+        0,071). Vokodér, speaker encoder i tokenizer jsou bitově shodné,
+        takže i podmínky z conds.pt zůstávají platné.
+        """
+        if os.environ.get("AUDIOBOOKERY_MEANFLOW", "1") == "0":
+            self.log(T("log_mf_ne", "AUDIOBOOKERY_MEANFLOW=0"))
+            return False
+
+        try:
+            from huggingface_hub import hf_hub_download
+            from safetensors.torch import load_file
+            from chatterbox.models.s3gen import S3Gen
+        except Exception as chyba:
+            self.log(T("log_mf_ne", f"{type(chyba).__name__}: {chyba}"))
+            return False
+
+        try:
+            argumenty = dict(repo_id=MEANFLOW_REPO, filename=MEANFLOW_FILE,
+                             cache_dir=str(CACHE_DIR / "hub"))
+            try:
+                cesta = hf_hub_download(local_files_only=True, **argumenty)
+            except Exception:
+                self.log(T("log_mf_stahuji", MEANFLOW_GB))
+                with self._hlaseni_stahovani(T("log_mf")):
+                    cesta = hf_hub_download(
+                        token=os.environ.get("HF_TOKEN") or None, **argumenty)
+
+            dekoder = S3Gen(meanflow=True)
+            dekoder.load_state_dict(load_file(cesta, device="cpu"))
+            self.model.s3gen = dekoder.to(self.zarizeni).eval()
+            self._hlas_klic = None      # podmínky musí spočítat nový dekodér
+            uvolni_pamet_zarizeni()
+            self.log(T("log_mf"))
+            return True
+        except Exception as chyba:
+            self.log(T("log_mf_ne", f"{type(chyba).__name__}: {chyba}"))
+            return False
 
     # ------------------------------------------------------------------
     def _odemkni_jazyk(self, modul, kod: str):
@@ -1352,6 +1643,7 @@ class TtsEngine:
             return
 
         soubor = kandidati[0]
+        self._t3_soubor = soubor
         self.log(T("log_ft_aplikuji", soubor.name))
 
         try:
@@ -1397,18 +1689,69 @@ class TtsEngine:
             self.log(T("log_ft_nepovedlo", chyba))
 
     # ------------------------------------------------------------------
+    def _priprav_hlas(self, referencni_wav: str, exaggeration: float) -> bool:
+        """Zakóduje referenční hlas jednou. True = podmínky jsou na modelu.
+
+        Chatterbox si při každém generate() s audio_prompt_path znovu načte
+        WAV z disku a prožene ho enkodéry - a to mimo no_grad, takže si
+        výsledek s sebou nese celý graf pro zpětný průchod. U jedné ukázky
+        je to jedno, u tisíců bloků je to jak zbytečná práce navíc, tak
+        hlavní důvod, proč paměť procesu roste přes celou kapitolu.
+        Připravíme podmínky jednou a dál už modelu podáváme jen text.
+        """
+        import torch
+
+        if not (referencni_wav and Path(referencni_wav).exists()):
+            # Bez reference se čte výchozím hlasem modelu. Vracíme ho zpátky -
+            # po předchozím generování s referencí by na modelu jinak zůstal
+            # cizí hlas až do dalšího načtení modelu.
+            if self._hlas_klic is not None and self._vychozi_conds is not None:
+                self.model.conds = self._vychozi_conds
+                self._hlas_klic = None
+            return getattr(self.model, "conds", None) is not None
+
+        try:
+            klic = (str(referencni_wav), Path(referencni_wav).stat().st_mtime_ns,
+                    round(float(exaggeration), 6))
+        except OSError:
+            return False
+        if klic == self._hlas_klic and getattr(self.model, "conds", None) is not None:
+            return True
+
+        try:
+            with torch.no_grad():
+                self.model.prepare_conditionals(referencni_wav,
+                                                exaggeration=float(exaggeration))
+        except Exception as chyba:
+            # Starší build bez prepare_conditionals nebo nečitelná nahrávka -
+            # ať to nespadne, necháme přípravu na chatterboxu u každého bloku.
+            self._hlas_klic = None
+            self.log(T("log_hlas_znovu", chyba))
+            return False
+
+        self._hlas_klic = klic
+        self.log(T("log_hlas_pripraven", Path(referencni_wav).name))
+        return True
+
+    # ------------------------------------------------------------------
     def generuj(self, text: str, referencni_wav: str, exaggeration: float,
                 cfg_weight: float, temperature: float):
         """Vrátí numpy pole float32 (mono) s vygenerovanou řečí."""
         import numpy as np
+
+        # Bez tohohle se generování s každým blokem zpomaluje - viz komentář
+        # u funkce. MLX cesta hooky nepoužívá, tam není co uklízet.
+        if not self.mlx:
+            uvolni_hooky_t3(self.model)
 
         argumenty = dict(
             exaggeration=float(exaggeration),
             cfg_weight=float(cfg_weight),
             temperature=float(temperature),
         )
-        if referencni_wav and Path(referencni_wav).exists():
-            argumenty["audio_prompt_path"] = referencni_wav
+        if not self._priprav_hlas(referencni_wav, exaggeration):
+            if referencni_wav and Path(referencni_wav).exists():
+                argumenty["audio_prompt_path"] = referencni_wav
 
         kod = (self.jazyk or {}).get("kod", "en")
         if self.podporuje_jazyk:
@@ -1425,7 +1768,31 @@ class TtsEngine:
         if hasattr(wav, "detach"):
             wav = wav.detach().cpu().numpy()
         wav = np.asarray(wav, dtype="float32").reshape(-1)
+        self._uvolni_mezi_bloky()
         return wav
+
+    # ------------------------------------------------------------------
+    def _uvolni_mezi_bloky(self):
+        """Vrátí systému paměť, kterou si alokátor drží po dogenerovaném bloku.
+
+        Torch na MPS si pooluje buffery podle velikosti. Každý blok má jinou
+        délku, takže pool pořád dostává nové velikosti a sám se nikdy
+        nevyprázdní. Naměřeno: s pevnou délkou tokenů roste paměť o 0,26 MB
+        na blok, s proměnnou o 130 MB - za kapitolu tedy desítky GB a nakonec
+        swap, ve kterém generování zpomalí na dvojnásobek. Uvolnění po každém
+        bloku to srazí na 0,17 MB.
+
+        Jen pro MPS. Na CUDA se stejný problém neprojevuje a empty_cache()
+        po každém bloku by tam jen zdržovalo, protože vrací paměť ovladači.
+        """
+        if self.zarizeni != "mps":
+            return
+        try:
+            import torch
+
+            torch.mps.empty_cache()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     def uvolni(self):
@@ -1433,13 +1800,11 @@ class TtsEngine:
         self.finetune_nacten = False
         self.nacteny_repo = None
         self.podporuje_jazyk = True
-        try:
-            import torch, gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        self._hlas_klic = None
+        self._vychozi_conds = None
+        self.mlx = False
+        self._t3_soubor = None
+        uvolni_pamet_zarizeni()
 
 
 def nastav_seed(seed: int):
@@ -1454,6 +1819,13 @@ def nastav_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    try:
+        # Když T3 běží v MLX, vzorkuje z jeho generátoru, ne z torchového.
+        import mlx.core as mx
+
+        mx.random.seed(seed)
+    except Exception:
+        pass
 
 
 def generuj_blok(engine, blok: str, p: dict, index: int, celkem: int, log) -> object:
@@ -1461,6 +1833,16 @@ def generuj_blok(engine, blok: str, p: dict, index: int, celkem: int, log) -> ob
 
     Používají to obě cesty - jednoprocesová i jednotlivý pracovník poolu.
     """
+    # Přesný vstup modelu na stdout, ať se dá u zaseknutého bloku dohledat,
+    # jaká konstrukce ho rozhodila. Do okna to nejde schválně - při tisících
+    # bloků by se v logu ztratilo všechno ostatní. Blok je omezený na
+    # max_znaku, takže se vejde na jednu řádku a nemá smysl ho zkracovat.
+    # Pod pythonw stdout neexistuje, proto to nesmí nic shodit.
+    try:
+        print(f"[{index}/{celkem} | {len(blok)} chars] {blok}", flush=True)
+    except Exception:
+        pass
+
     # Hrubý horní odhad délky: české čtení jede kolem 12-16 znaků/s
     max_delka = len(blok) / 8.0 + 3.0
 
@@ -1481,12 +1863,7 @@ def generuj_blok(engine, blok: str, p: dict, index: int, celkem: int, log) -> ob
             return vzorky
         except Exception as chyba:
             log(T("log_pokus", index, celkem, pokus, chyba))
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+            uvolni_pamet_zarizeni()
             time.sleep(0.5)
 
     log(T("log_preskocen", index, celkem, blok[:60]))
@@ -1608,6 +1985,73 @@ class Pool:
 #  GUI
 # ==========================================================================
 
+class Bublina:
+    """Vysvětlivka, která vyskočí po zastavení kurzoru nad prvkem.
+
+    Tkinter bubliny neumí, takže je to Toplevel bez dekorací. Text se láme
+    na wraplength - na nízkém monitoru se dlouhé vysvětlení nesmí rozlít
+    přes celé okno. Bublina se váže na widget metodou add="+", aby
+    nepřepsala obsluhu, kterou už widget může mít.
+    """
+
+    def __init__(self, widget, text: str, zpozdeni: int = 450, sirka: int = 360):
+        self.widget = widget
+        self.text = text
+        self.zpozdeni = zpozdeni
+        self.sirka = sirka
+        self._okno = None
+        self._naplanovano = None
+        widget.bind("<Enter>", self._prichod, add="+")
+        widget.bind("<Leave>", self._odchod, add="+")
+        widget.bind("<ButtonPress>", self._odchod, add="+")
+
+    def _prichod(self, _udalost=None):
+        self._zrus_plan()
+        self._naplanovano = self.widget.after(self.zpozdeni, self._zobraz)
+
+    def _odchod(self, _udalost=None):
+        self._zrus_plan()
+        if self._okno is not None:
+            try:
+                self._okno.destroy()
+            except Exception:
+                pass
+            self._okno = None
+
+    def _zrus_plan(self):
+        if self._naplanovano is not None:
+            try:
+                self.widget.after_cancel(self._naplanovano)
+            except Exception:
+                pass
+            self._naplanovano = None
+
+    def _zobraz(self):
+        self._naplanovano = None
+        if self._okno is not None:
+            return
+        try:
+            if not self.widget.winfo_exists():
+                return
+            x = self.widget.winfo_rootx()
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            self._okno = tk.Toplevel(self.widget)
+            self._okno.wm_overrideredirect(True)
+            try:
+                self._okno.wm_attributes("-topmost", True)
+            except Exception:
+                pass
+            ramec = tk.Frame(self._okno, background=BARVY["linka"])
+            ramec.pack()
+            tk.Label(ramec, text=self.text, justify="left", wraplength=self.sirka,
+                     background=BARVY["panel_svetlejsi"], foreground=BARVY["text_pole"],
+                     borderwidth=0, padx=10, pady=8).pack(padx=1, pady=1)
+            self._okno.wm_geometry(f"+{x}+{y}")
+        except Exception:
+            # Bublina je komfort, ne funkce - když ji WM odmítne, mlčíme.
+            self._okno = None
+
+
 class Aplikace(tk.Tk):
 
     def __init__(self):
@@ -1618,8 +2062,13 @@ class Aplikace(tk.Tk):
         nastav_jazyk(self.config_data.get("jazyk", "en"))
 
         self.title(f"{T('app_nazev')} v{VERSION}")
-        self.geometry("1000x980")
-        self.minsize(920, 820)
+        # Na nízkém monitoru se okno o pevných 980 bodech nevejde a spodek
+        # s ovládáním a průběhem zůstane pod hranou obrazovky. Minimum musí
+        # zůstat nízko - se sbalenými sekcemi se okno smrskne na pár set bodů.
+        sirka = min(1000, max(700, self.winfo_screenwidth() - 80))
+        vyska = min(980, max(480, self.winfo_screenheight() - 120))
+        self.geometry(f"{sirka}x{vyska}")
+        self.minsize(min(760, sirka), min(460, vyska))
 
         self.fronta = queue.Queue()
         self.vlakno = None
@@ -1630,10 +2079,14 @@ class Aplikace(tk.Tk):
         self.bloky = []          # (index_kapitoly, text_bloku)
         self.kapitoly = []
         self.ma_kapitoly = False
+        self._kapitola_v_behu = -1    # kapitola, kterou právě ukazuje pruh průběhu
         self.nazev_knihy = ""
         self.bezi = False
         self.prehravac = None
         self.obalka_cesta = None      # ať přežije přestavbu okna při změně jazyka
+        # Kopie, ne odkaz do DEFAULT_CONFIG - ten je sdílený a nesmí se měnit
+        ulozene_sekce = self.config_data.get("sbalene_sekce")
+        self.sbalene_sekce = dict(ulozene_sekce) if isinstance(ulozene_sekce, dict) else {}
 
         self._vytvor_promenne()
         self._vytvor_gui()
@@ -1687,12 +2140,14 @@ class Aplikace(tk.Tk):
             "seed": int(self.var_seed.get() or 0),
             "jazyk_textu": self._klic_jazyka_textu(),
             "zarizeni": self.var_zarizeni.get(),
+            "mlx_presnost": self.var_mlx.get(),
             "testovaci_veta": self.var_test_veta.get(),
             "poslouchat": bool(self.var_poslouchat.get()),
             "naskok_s": int(self.var_naskok.get()),
             "obalka": bool(self.var_obalka.get()),
             "pracovniku": int(self.var_pracovniku.get()),
             "jazyk": aktualni_jazyk(),
+            "sbalene_sekce": dict(self.sbalene_sekce),
         }
         try:
             CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1762,6 +2217,7 @@ class Aplikace(tk.Tk):
         self.var_seed = tk.IntVar(value=c["seed"])
         self.var_jazyk_textu = tk.StringVar(value=self._nazev_jazyka_textu(c["jazyk_textu"]))
         self.var_zarizeni = tk.StringVar(value=c["zarizeni"])
+        self.var_mlx = tk.StringVar(value=c["mlx_presnost"])
         self.var_test_veta = tk.StringVar(value=c["testovaci_veta"])
         self.var_poslouchat = tk.BooleanVar(value=c["poslouchat"])
         self.var_naskok = tk.IntVar(value=c["naskok_s"])
@@ -1770,6 +2226,8 @@ class Aplikace(tk.Tk):
 
         self.var_stav = tk.StringVar(value=T("stav_pripraveno"))
         self.var_postup = tk.DoubleVar(value=0.0)
+        self.var_postup_kapitola = tk.DoubleVar(value=0.0)
+        self.var_kapitola_info = tk.StringVar(value="")
         self.var_bloky_info = tk.StringVar(value="—/—")
         self.var_cas_info = tk.StringVar(value="—:—:—  /  —:—:—")
         self.var_jazyk = tk.StringVar(value=JAZYKY.get(aktualni_jazyk(), "English"))
@@ -1892,7 +2350,7 @@ class Aplikace(tk.Tk):
         self._zamknout(e, r1, r2, c1)
 
         # ---------------- Poslech ----------------
-        poslech = self._sekce(hlavni, T("sekce_poslech"))
+        poslech = self._sekce_sbalitelna(hlavni, T("sekce_poslech"), klic="poslech")
         rada = ttk.Frame(poslech)
         rada.grid(row=0, column=0, sticky="ew")
         ttk.Checkbutton(rada, text=T("lab_prehravat"), variable=self.var_poslouchat,
@@ -1931,7 +2389,7 @@ class Aplikace(tk.Tk):
                   style="Tlumeny.TLabel").grid(row=2, column=0, sticky="w", pady=(10, 0))
 
         # ---------------- Pokročilé (sbaleno) ----------------
-        gen = self._sekce_sbalitelna(hlavni, T("sekce_pokrocile"))
+        gen = self._sekce_sbalitelna(hlavni, T("sekce_pokrocile"), klic="pokrocile")
         gen.columnconfigure(1, weight=1)
 
         self.popisky_posuvniku = {}
@@ -1965,13 +2423,25 @@ class Aplikace(tk.Tk):
         cb = ttk.Combobox(spodek, textvariable=self.var_zarizeni, width=6, state="readonly",
                           values=["auto", "cuda", "cpu"])
         cb.pack(side="left")
+
+        popis_mlx = ttk.Label(spodek, text=T("lab_mlx"))
+        popis_mlx.pack(side="left", padx=(24, 10))
+        cb_mlx = ttk.Combobox(spodek, textvariable=self.var_mlx, width=8, state="readonly",
+                              values=list(MLX_PRESNOSTI))
+        cb_mlx.pack(side="left")
+        Bublina(popis_mlx, T("tip_mlx"))
+        Bublina(cb_mlx, T("tip_mlx"))
+
         ch2 = ttk.Checkbutton(spodek, text=T("lab_obalka"), variable=self.var_obalka)
-        ch2.pack(side="left", padx=(28, 0))
-        ttk.Label(spodek, text=T("lab_pracovniku")).pack(side="left", padx=(28, 12))
+        ch2.pack(side="left", padx=(24, 0))
+        popis_prac = ttk.Label(spodek, text=T("lab_pracovniku"))
+        popis_prac.pack(side="left", padx=(24, 10))
         sp_w = ttk.Spinbox(spodek, from_=0, to=4, increment=1,
                            textvariable=self.var_pracovniku, width=5)
         sp_w.pack(side="left")
-        self._zamknout(cb, ch2, sp_w)
+        Bublina(popis_prac, T("tip_pracovniku"))
+        Bublina(sp_w, T("tip_pracovniku"))
+        self._zamknout(cb, cb_mlx, ch2, sp_w)
 
         # ---------------- Ovládání ----------------
         ovladani = ttk.Frame(hlavni)
@@ -1997,15 +2467,33 @@ class Aplikace(tk.Tk):
         ttk.Progressbar(postup, variable=self.var_postup, maximum=100.0,
                         style="Tenky.Horizontal.TProgressbar").grid(
             row=0, column=0, columnspan=3, sticky="ew")
-        ttk.Label(postup, textvariable=self.var_stav).grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        # Hranice kapitol. Na ttk.Progressbar se kreslit nedá, takže rysky
+        # leží na vlastním plátně hned pod ním - šířka i měřítko sedí.
+        self.platno_kapitoly = tk.Canvas(postup, height=6, highlightthickness=0,
+                                         background=BARVY["pozadi"], borderwidth=0)
+        self.platno_kapitoly.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        self.platno_kapitoly.bind("<Configure>", lambda _u: self._vykresli_znacky_kapitol())
+
+        # Druhý pruh sleduje jen právě zpracovávanou kapitolu
+        self.pruh_kapitoly = ttk.Progressbar(postup, variable=self.var_postup_kapitola,
+                                             maximum=100.0,
+                                             style="Tenky.Horizontal.TProgressbar")
+        self.pruh_kapitoly.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+
+        ttk.Label(postup, textvariable=self.var_stav).grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Label(postup, textvariable=self.var_bloky_info, style="Tlumeny.TLabel").grid(
-            row=1, column=1, sticky="e", padx=(16, 16), pady=(8, 0))
+            row=3, column=1, sticky="e", padx=(16, 16), pady=(8, 0))
         ttk.Label(postup, textvariable=self.var_cas_info, style="Tlumeny.TLabel").grid(
-            row=1, column=2, sticky="e", pady=(8, 0))
+            row=3, column=2, sticky="e", pady=(8, 0))
+        ttk.Label(postup, textvariable=self.var_kapitola_info, style="Tlumeny.TLabel").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        self._aktualizuj_pruh_kapitol()
 
         # ---------------- Log ----------------
         ramec_log = self._sekce_sbalitelna(hlavni, T("sekce_prubeh"), sbaleno=False,
-                                           roztahnout=True, mezera_nahore=20)
+                                           roztahnout=True, mezera_nahore=20, klic="prubeh")
         ramec_log.columnconfigure(0, weight=1)
         ramec_log.rowconfigure(0, weight=1)
 
@@ -2067,8 +2555,13 @@ class Aplikace(tk.Tk):
         return obsah
 
     def _sekce_sbalitelna(self, rodic, nadpis: str, sbaleno: bool = True,
-                          roztahnout: bool = False, mezera_nahore: int = 0) -> ttk.Frame:
-        """Sekce, kterou lze kliknutím na nadpis sbalit. Drží pokročilá nastavení z cesty."""
+                          roztahnout: bool = False, mezera_nahore: int = 0,
+                          klic: str = "") -> ttk.Frame:
+        """Sekce, kterou lze kliknutím na nadpis sbalit. Drží pokročilá nastavení z cesty.
+
+        Se zadaným 'klic' si stav pamatuje v konfiguraci - kdo si okno jednou
+        zkrátí, ať to nemusí dělat po každém spuštění znovu.
+        """
         obal = ttk.Frame(rodic)
         obal.pack(fill="both" if roztahnout else "x",
                   expand=roztahnout, pady=(mezera_nahore, 20))
@@ -2088,7 +2581,7 @@ class Aplikace(tk.Tk):
         obsah = ttk.Frame(obal)
         obsah.columnconfigure(0, weight=1)
 
-        stav = {"sbaleno": sbaleno}
+        stav = {"sbaleno": bool(self.sbalene_sekce.get(klic, sbaleno)) if klic else sbaleno}
 
         def vykresli():
             sipka = "+" if stav["sbaleno"] else "−"
@@ -2101,6 +2594,12 @@ class Aplikace(tk.Tk):
         def prepni(_udalost=None):
             stav["sbaleno"] = not stav["sbaleno"]
             vykresli()
+            if klic:
+                self.sbalene_sekce[klic] = stav["sbaleno"]
+                try:
+                    self._uloz_config()
+                except tk.TclError:
+                    pass      # rozepsaná hodnota v poli, uloží se až při ukončení
 
         for w in (znacka, linka, zahlavi):
             w.bind("<Button-1>", prepni)
@@ -2236,6 +2735,7 @@ class Aplikace(tk.Tk):
     #  Log a fronta zpráv z pracovního vlákna
     # ------------------------------------------------------------------
     def log(self, zprava: str):
+        zprava = str(zprava)
         if zprava.startswith("CHYBA"):
             znacka = "chyba"
         elif zprava.startswith("VAROVÁNÍ"):
@@ -2245,11 +2745,20 @@ class Aplikace(tk.Tk):
         else:
             znacka = "bezny"
 
+        cas = time.strftime("%H:%M:%S  ")
         self.log_box.config(state="normal")
-        self.log_box.insert("end", time.strftime("%H:%M:%S  "), "cas")
+        self.log_box.insert("end", cas, "cas")
         self.log_box.insert("end", f"{zprava}\n", znacka)
         self.log_box.see("end")
         self.log_box.config(state="disabled")
+
+        # Totéž na stdout - při spuštění z konzole jde průběh sledovat
+        # i bez okna a dá se přesměrovat do souboru. Pod pythonw stdout
+        # neexistuje, proto to nesmí nic shodit.
+        try:
+            print(cas + zprava, flush=True)
+        except Exception:
+            pass
 
     def log_z_vlakna(self, zprava: str):
         self.fronta.put(("log", zprava))
@@ -2389,6 +2898,69 @@ class Aplikace(tk.Tk):
         self.after(80, self._vykresli_hladinu)
 
     # ------------------------------------------------------------------
+    #  Kapitoly v ukazateli průběhu
+    # ------------------------------------------------------------------
+    def _spocitej_rozsahy_kapitol(self):
+        """Doplní ke každé kapitole rozsah bloků - 1-based, oba konce včetně.
+
+        Bloky se číslují průběžně přes celou knihu, takže bez tohoto rozpisu
+        se z indexu bloku nepozná, jak daleko je člověk v aktuální kapitole.
+        """
+        for i, kap in enumerate(self.kapitoly):
+            kap["prvni"] = kap["prvni_blok"] + 1
+            kap["posledni"] = (self.kapitoly[i + 1]["prvni_blok"]
+                               if i + 1 < len(self.kapitoly) else len(self.bloky))
+            kap["bloku"] = kap["posledni"] - kap["prvni"] + 1
+
+    def _aktualizuj_pruh_kapitol(self):
+        """Pruh a rysky kapitol schová u knihy, která na kapitoly rozdělená není."""
+        ma = len(self.kapitoly) > 1
+        for w in (self.platno_kapitoly, self.pruh_kapitoly):
+            if ma:
+                w.grid()
+            else:
+                w.grid_remove()
+        if not ma:
+            self.var_postup_kapitola.set(0.0)
+            self.var_kapitola_info.set("")
+        self._vykresli_znacky_kapitol()
+
+    def _vykresli_znacky_kapitol(self):
+        """Svislé rysky na hranicích kapitol, právě běžící kapitola podtržená."""
+        platno = getattr(self, "platno_kapitoly", None)
+        if platno is None:
+            return
+        platno.delete("all")
+        if len(self.kapitoly) <= 1 or not self.bloky:
+            return
+
+        sirka = max(platno.winfo_width(), 1)
+        vyska = max(platno.winfo_height(), 1)
+        celkem = float(len(self.bloky))
+
+        for i, kap in enumerate(self.kapitoly):
+            x = min(sirka - 1.0, kap["prvni_blok"] / celkem * sirka)
+            if i == self._kapitola_v_behu:
+                x2 = min(float(sirka), kap["posledni"] / celkem * sirka)
+                platno.create_rectangle(x, vyska - 3, max(x + 1.0, x2), vyska,
+                                        fill=BARVY["akcent"], outline="")
+            platno.create_line(x, 0, x, vyska, fill=BARVY["linka"])
+
+    def _postup_kapitoly(self, hotovo: int, kap_i: int):
+        """Přepočítá druhý pruh a jeho popisek na pozici uvnitř kapitoly."""
+        if len(self.kapitoly) <= 1 or not (0 <= kap_i < len(self.kapitoly)):
+            return
+        kap = self.kapitoly[kap_i]
+        v_kapitole = hotovo - kap["prvni"] + 1
+        self.var_postup_kapitola.set(
+            100.0 * v_kapitole / kap["bloku"] if kap["bloku"] else 0.0)
+        self.var_kapitola_info.set(T("prubeh_kapitola", kap_i + 1, len(self.kapitoly),
+                                     v_kapitole, kap["bloku"], kap["posledni"]))
+        if kap_i != self._kapitola_v_behu:
+            self._kapitola_v_behu = kap_i
+            self._vykresli_znacky_kapitol()
+
+    # ------------------------------------------------------------------
     def zobraz_obalku(self, cesta: Path):
         """Vykreslí vygenerovanou obálku do malého náhledu."""
         try:
@@ -2411,11 +2983,12 @@ class Aplikace(tk.Tk):
                 if typ == "log":
                     self.log(data)
                 elif typ == "postup":
-                    hotovo, celkem, uplynulo, zbyva = data
+                    hotovo, celkem, uplynulo, zbyva, kap_i = data
                     self.var_postup.set(100.0 * hotovo / celkem if celkem else 0.0)
                     self.var_bloky_info.set(T("prubeh_bloky", hotovo, celkem))
                     self.var_cas_info.set(
                         T("prubeh_cas", formatuj_cas(uplynulo), formatuj_cas(zbyva)))
+                    self._postup_kapitoly(hotovo, kap_i)
                 elif typ == "stav":
                     self.var_stav.set(data)
                 elif typ == "hotovo":
@@ -2470,13 +3043,14 @@ class Aplikace(tk.Tk):
         slozka = Path(self.var_vystup_slozka.get())
         slozka.mkdir(parents=True, exist_ok=True)
         try:
-            os.startfile(str(slozka))
+            otevri_v_systemu(slozka)
         except Exception as chyba:
+            self.log(chyba)
             messagebox.showerror(T("dlg_chyba"), T("dlg_slozka", chyba))
 
     def prehraj(self, cesta: Path):
         try:
-            os.startfile(str(cesta))
+            otevri_v_systemu(cesta)
         except Exception:
             self.log(T("log_ulozen", cesta))
 
@@ -2515,6 +3089,11 @@ class Aplikace(tk.Tk):
             if not self.bloky:
                 raise ValueError("Text se nepodařilo rozdělit na bloky.")
             self.ma_kapitoly = ma_kapitoly and len(self.kapitoly) > 1
+            self._spocitej_rozsahy_kapitol()
+            self._kapitola_v_behu = -1
+            self.var_postup_kapitola.set(0.0)
+            self.var_kapitola_info.set("")
+            self._aktualizuj_pruh_kapitol()
 
             self.nazev_knihy = cesta.stem
             znaku = sum(len(b) for _, b in self.bloky)
@@ -2531,6 +3110,8 @@ class Aplikace(tk.Tk):
             self.bloky = []
             self.kapitoly = []
             self.ma_kapitoly = False
+            self._kapitola_v_behu = -1
+            self._aktualizuj_pruh_kapitol()
             self.var_soubor_info.set(T("info_nezdarilo"))
             self.log(T("log_chyba", chyba))
             messagebox.showerror(T("dlg_chyba_nacteni"), str(chyba))
@@ -2559,7 +3140,8 @@ class Aplikace(tk.Tk):
     def _worker_test(self, veta: str, p: dict):
         vystup = None
         try:
-            self.engine.nacti_model(p["zarizeni"], p["jazyk_textu"])
+            self.engine.nacti_model(p["zarizeni"], p["jazyk_textu"],
+                                    p.get("mlx_presnost", MLX_PRESNOST_VYCHOZI))
             nastav_seed(p["seed"])
 
             self.log_z_vlakna(T("log_generuji_uk"))
@@ -2592,6 +3174,7 @@ class Aplikace(tk.Tk):
             "temperature": float(self.var_temp.get()),
             "seed": int(self.var_seed.get() or 0),
             "zarizeni": self.var_zarizeni.get(),
+            "mlx_presnost": self.var_mlx.get(),
             "jazyk_textu": self._klic_jazyka_textu(),
             "pauza_ms": int(self.var_pauza.get()),
             "format": self.var_format.get(),
@@ -2668,6 +3251,9 @@ class Aplikace(tk.Tk):
         self.btn_stop.config(state="normal")
         self._zamkni_ovladani(True)      # formát ani cesty už za běhu neměnit
         self.var_postup.set(100.0 * od_bloku / len(self.bloky) if od_bloku else 0.0)
+        self.var_postup_kapitola.set(0.0)
+        self._kapitola_v_behu = -1
+        self._vykresli_znacky_kapitol()
         self.var_poslech_info.set("")
 
         self.vlakno = threading.Thread(
@@ -2705,7 +3291,8 @@ class Aplikace(tk.Tk):
             pocet = int(p.get("pracovniku") or 0) or doporuceny_pocet_pracovniku()
             if pocet > 1:
                 self.log_z_vlakna(T("log_pool_start", pocet, volna_vram_gb()))
-                pool = Pool(pocet, {"zarizeni": p["zarizeni"], "jazyk_textu": p["jazyk_textu"]},
+                pool = Pool(pocet, {"zarizeni": p["zarizeni"], "jazyk_textu": p["jazyk_textu"],
+                                    "mlx_presnost": p.get("mlx_presnost", MLX_PRESNOST_VYCHOZI)},
                             self.log_z_vlakna)
                 if not pool.pockej_na_start():
                     self.log_z_vlakna(T("log_pool_selhal", pool.chyba or "?"))
@@ -2716,7 +3303,8 @@ class Aplikace(tk.Tk):
 
             if pool is None:
                 self.log_z_vlakna(T("log_pool_jeden"))
-                self.engine.nacti_model(p["zarizeni"], p["jazyk_textu"])
+                self.engine.nacti_model(p["zarizeni"], p["jazyk_textu"],
+                                    p.get("mlx_presnost", MLX_PRESNOST_VYCHOZI))
                 sr = self.engine.sr
             else:
                 sr = pool.sr
@@ -2740,6 +3328,7 @@ class Aplikace(tk.Tk):
             self.log_z_vlakna(T("log_start", celkem, slozka))
             if po_kapitolach:
                 self.log_z_vlakna(T("log_po_kapitolach", len(self.kapitoly)))
+            self._log_rozpis_kapitol()
 
             obalka_cesta = None
             if p["obalka"]:
@@ -2815,8 +3404,13 @@ class Aplikace(tk.Tk):
                 pool._dalsi = od_bloku + 1
 
             start = time.time()
+            logovana_kap = -1
 
             for index, kap_i, blok, vzorky in self._proud_bloku(bloky, p, od_bloku, pool):
+                if kap_i != logovana_kap:
+                    logovana_kap = kap_i
+                    self._log_zacatek_kapitoly(kap_i, index, celkem)
+
                 # nová kapitola = nový soubor
                 if self._zapisovac is None or (po_kapitolach and kap_i != aktualni_kap):
                     if po_kapitolach and self._zapisovac is not None:
@@ -2841,12 +3435,17 @@ class Aplikace(tk.Tk):
                 uplynulo = time.time() - start
                 rychlost = (znaku_hotovo - znaku_pred) / uplynulo if uplynulo > 0 else 0
                 zbyva = (znaku_celkem - znaku_hotovo) / rychlost if rychlost > 0 else -1
-                self.fronta.put(("postup", (index, celkem, uplynulo, zbyva)))
+                self.fronta.put(("postup", (index, celkem, uplynulo, zbyva, kap_i)))
 
                 if index % 25 == 0:
-                    self.log_z_vlakna(T("log_prubeh", index, celkem,
-                                        formatuj_cas(self._zapisovac.delka_s),
-                                        formatuj_cas(uplynulo), formatuj_cas(zbyva)))
+                    zprava = T("log_prubeh", index, celkem,
+                               formatuj_cas(self._zapisovac.delka_s),
+                               formatuj_cas(uplynulo), formatuj_cas(zbyva))
+                    if len(self.kapitoly) > 1:
+                        kap = self.kapitoly[kap_i]
+                        zprava += T("log_prubeh_kap", kap_i + 1, len(self.kapitoly),
+                                    index - kap["prvni"] + 1, kap["bloku"], kap["posledni"])
+                    self.log_z_vlakna(zprava)
                     self._vycisti_vram()
 
             if pool is not None:
@@ -2965,16 +3564,39 @@ class Aplikace(tk.Tk):
             hotovo = index
             yield index, bloky[index - 1][0], bloky[index - 1][1], vzorky
 
+    # Delší rozpis by z logu udělal seznam kapitol - dál stačí souhrnný řádek
+    ROZPIS_MAX = 50
+
+    def _log_rozpis_kapitol(self):
+        """Kolik bloků připadá na kterou kapitolu. Hlásí se jednou, na startu."""
+        if len(self.kapitoly) <= 1:
+            return
+        self.log_z_vlakna(T("log_rozpis_kapitol", len(self.kapitoly), len(self.bloky)))
+        for i, kap in enumerate(self.kapitoly[:self.ROZPIS_MAX]):
+            self.log_z_vlakna(T("log_rozpis_radek", i + 1,
+                                (kap.get("nazev") or T("kap_bez_nazvu"))[:50],
+                                kap["bloku"], kap["prvni"], kap["posledni"]))
+        if len(self.kapitoly) > self.ROZPIS_MAX:
+            self.log_z_vlakna(T("log_rozpis_dalsi", len(self.kapitoly) - self.ROZPIS_MAX))
+
+    def _log_zacatek_kapitoly(self, kap_i: int, index: int, celkem: int):
+        """Při přechodu na kapitolu ohlásí, co v ní ještě zbývá.
+
+        Po navázání na přerušený běh se nezačíná na prvním bloku kapitoly,
+        proto se zbytek počítá od právě zpracovávaného bloku.
+        """
+        if len(self.kapitoly) <= 1 or not (0 <= kap_i < len(self.kapitoly)):
+            return
+        kap = self.kapitoly[kap_i]
+        self.log_z_vlakna(T("log_kapitola_start", kap_i + 1, len(self.kapitoly),
+                            (kap.get("nazev") or T("kap_bez_nazvu"))[:50],
+                            kap["posledni"] - index + 1, index, kap["posledni"], celkem))
+
     def _generuj_s_opakovanim(self, blok: str, p: dict, index: int, celkem: int):
         return generuj_blok(self.engine, blok, p, index, celkem, self.log_z_vlakna)
 
     def _vycisti_vram(self):
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        uvolni_pamet_zarizeni()
 
     def _prevod_dokoncen(self, cesta, chyba=None):
         self.bezi = False
@@ -3000,6 +3622,7 @@ class Aplikace(tk.Tk):
         self.var_stav.set(T("stav_zastaveno") if zastaveno else T("stav_hotovo"))
         if not zastaveno:
             self.var_postup.set(100.0)
+            self.var_postup_kapitola.set(100.0)
 
         nadpis = T("stav_zastaveno") if zastaveno else T("dlg_hotovo")
         popis = T("dlg_zastaveno_text") if zastaveno else T("dlg_hotovo_text")

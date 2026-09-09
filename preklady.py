@@ -99,6 +99,8 @@ TEXTY = {
                          "{0}  |  {1} znaků  |  {2} bloků  |  odhad délky audia ~{3}"),
     "prubeh_bloky":     ("{0}/{1}", "{0}/{1}"),
     "prubeh_cas":       ("elapsed {0}  /  left {1}", "uplynulo {0}  /  zbývá {1}"),
+    "prubeh_kapitola":  ("chapter {0}/{1} · block {2}/{3} in chapter · chapter ends at block {4}",
+                         "kapitola {0}/{1} · blok {2}/{3} v kapitole · kapitola končí blokem {4}"),
     "vizu_ticho":       ("silent", "ticho"),
 
     # ---------------- Poslech ----------------
@@ -190,10 +192,27 @@ TEXTY = {
                          "pokud bude hlas divný, zvolte jiný jazykový model."),
     "log_ft_nepovedlo": ("WARNING: could not apply the checkpoint ({0}). Continuing with the base model.",
                          "VAROVÁNÍ: checkpoint se nepodařilo použít ({0}). Pokračuji se základním modelem."),
+    # ---------------- Akcelerace MLX (Apple Silicon) ----------------
+    "log_mlx_t3":       ("MLX: T3 running on the GPU cores, {0} backbone.",
+                         "MLX: T3 běží na grafických jádrech, backbone {0}."),
+    "log_mf":       ("Distilled decoder active - 2 flow steps instead of 10.",
+                         "Destilovaný dekodér aktivní - 2 kroky flow místo 10."),
+    "log_mf_stahuji": ("Downloading the distilled decoder ({0} GB, one time only)...",
+                           "Stahuji destilovaný dekodér ({0} GB, jen jednou)..."),
+    "log_mf_ne":    ("Distilled decoder unavailable ({0}). Using the standard decoder.",
+                         "Destilovaný dekodér není k dispozici ({0}). Používám standardní."),
+    "log_mlx_ne":       ("MLX acceleration off ({0}). Running on PyTorch.",
+                         "Akcelerace MLX vypnuta ({0}). Běžím na PyTorch."),
     "log_lang_ne":      ("WARNING: the model rejected language_id='{0}' ({1}). "
                          "Generating without a language - quality may suffer.",
                          "VAROVÁNÍ: parametr language_id='{0}' model nepřijal ({1}). "
                          "Generuji bez určení jazyka - kvalita může být horší."),
+    "log_hlas_pripraven": ("Reference voice {0} encoded once, reused for every block.",
+                           "Referenční hlas {0} zakódován jednou, použije se pro všechny bloky."),
+    "log_hlas_znovu":   ("WARNING: could not pre-encode the reference voice ({0}) - "
+                         "it will be encoded again for every block.",
+                         "VAROVÁNÍ: referenční hlas se nepodařilo předpřipravit ({0}) - "
+                         "bude se kódovat znovu u každého bloku."),
     "log_stahovani":    ("{0}: {1:.2f} GB downloaded ...", "{0}: staženo {1:.2f} GB ..."),
     "log_zaklad_model": ("Base model", "Základní model"),
     "log_ft_popis":     ("Czech fine-tune", "Český fine-tune"),
@@ -218,6 +237,8 @@ TEXTY = {
                          "Zastaveno uživatelem na bloku {0}/{1}."),
     "log_prubeh":       ("{0}/{1} blocks  |  audio {2}  |  elapsed {3}  |  left ~{4}",
                          "{0}/{1} bloků  |  audio {2}  |  uplynulo {3}  |  zbývá ~{4}"),
+    "log_prubeh_kap":   ("  |  chapter {0}/{1} {2}/{3} (ends at block {4})",
+                         "  |  kapitola {0}/{1} {2}/{3} (končí blokem {4})"),
     "log_dobira":       ("Generating finished, playback is draining the remaining {0}.",
                          "Generování hotovo, přehrávání dobírá zbývajících {0}."),
     "log_mp3":          ("Converting output to MP3 (ffmpeg)...",
@@ -264,6 +285,16 @@ TEXTY = {
     "log_po_kapitolach": ("Writing one MP3 per chapter ({0} chapters).",
                           "Zapisuji jeden MP3 na kapitolu ({0} kapitol)."),
     "log_kapitola_hotova": ("Chapter {0} done: {1}", "Kapitola {0} hotova: {1}"),
+    "kap_bez_nazvu":    ("untitled", "bez názvu"),
+    "log_rozpis_kapitol": ("Blocks per chapter ({0} chapters, {1} blocks in total):",
+                           "Rozpis bloků po kapitolách ({0} kapitol, celkem {1} bloků):"),
+    "log_rozpis_radek": ("  [{0:02d}] {1} — {2} blocks, blocks {3}–{4}",
+                         "  [{0:02d}] {1} — {2} bloků, bloky {3}–{4}"),
+    "log_rozpis_dalsi": ("  … and {0} more chapters", "  … a dalších {0} kapitol"),
+    "log_kapitola_start": ("Chapter {0}/{1} · {2}: {3} blocks left in this chapter, "
+                           "starting at block {4}, chapter ends at block {5} (of {6}).",
+                           "Kapitola {0}/{1} · {2}: v této kapitole zbývá {3} bloků, "
+                           "začínám blokem {4}, kapitola končí blokem {5} (z {6})."),
     "log_souhrn_kapitoly": (" {0} chapter files written.", " Zapsáno {0} souborů kapitol."),
     "log_navazuji":     ("Resuming at block {0} of {1}.", "Navazuji od bloku {0} z {1}."),
     "log_navazuji_soubor": ("Continuing file {0}, already {1} of audio.",
@@ -286,6 +317,42 @@ TEXTY = {
                          "pokračuji jedním procesem."),
     "log_pool_jeden":   ("Generating in a single process.", "Generuji jedním procesem."),
     "lab_pracovniku":   ("parallel processes", "souběžných procesů"),
+    "lab_mlx":          ("T3 precision", "přesnost T3"),
+    "tip_mlx":          ("Quantisation of the T3 backbone. Applies only on Apple Silicon "
+                         "(MLX); elsewhere it is ignored.\n\n"
+                         "8-bit — recommended. 0.65 GB, 158 tok/s. Indistinguishable "
+                         "from float32 by ear.\n"
+                         "4-bit — 0.32 GB, but no faster than 8-bit: the decoding loop is "
+                         "bound by overhead, not memory. Saves RAM at a measurable "
+                         "quality cost.\n"
+                         "float32 — 2.0 GB, 58 tok/s. Slower and larger; a reference, "
+                         "not a setting to prefer.\n\n"
+                         "Changing this reloads the model.",
+                         "Kvantizace backbonu T3. Uplatní se jen na Apple Siliconu "
+                         "(MLX), jinde se ignoruje.\n\n"
+                         "8-bit — doporučeno. 0,65 GB, 158 tok/s. Od float32 sluchem "
+                         "nerozeznatelné.\n"
+                         "4-bit — 0,32 GB, ale rychlejší než 8 bitů už není: smyčka je "
+                         "vázaná režií, ne pamětí. Šetří paměť za měřitelnou cenu "
+                         "na kvalitě.\n"
+                         "float32 — 2,0 GB, 58 tok/s. Pomalejší i větší; reference, "
+                         "ne volba k preferování.\n\n"
+                         "Změna vyvolá znovunačtení modelu."),
+    "tip_pracovniku":   ("How many blocks are generated at once. Each process loads its "
+                         "own copy of the model.\n\n"
+                         "On Apple Silicon with MLX a single process already saturates "
+                         "the GPU, so more processes mostly add memory pressure "
+                         "(~1.7 GB each) - measured 2.9x realtime on two workers "
+                         "against 3-4.8x on one. Worth testing 1 against 2 on a real "
+                         "chapter.\n\n"
+                         "0 = derive the count from free memory.",
+                         "Kolik bloků se generuje současně. Každý proces si nese vlastní "
+                         "kopii modelu.\n\n"
+                         "Na Apple Siliconu s MLX vytíží grafiku už jeden proces, takže "
+                         "další jen přidávají nároky na paměť (~1,7 GB každý) - naměřeno "
+                         "2,9x reálného času na dvou procesech proti 3-4,8x na jednom. "
+                         "Vyplatí se zkusit 1 proti 2 na skutečné kapitole.\n\n"
+                         "0 = počet odvodit od volné paměti."),
     "dlg_navazat":      ("Resume", "Navázat"),
     "dlg_navazat_text": ("This book was interrupted at block {0} of {1} ({2:.0f} %).\n\nYes - continue where it stopped\nNo - start over\nCancel - do nothing",
                          "Tato kniha byla přerušena na bloku {0} z {1} ({2:.0f} %).\n\nAno - pokračovat tam, kde to skončilo\nNe - začít znovu\nZrušit - neprovádět nic"),
